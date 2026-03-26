@@ -11,6 +11,44 @@ import { tr } from 'motion/react-client';
 import { ACTExecutor, ACTTask } from './sim/actExecutor';
 import { ArmController } from './sim/armController';
 
+function getExpertAction(modelName: string, robotState: { x: number, z: number, rotation: number, velocity: number }, target: { position: { x: number, z: number } }, speed: number, turnSpeed: number): number[] {
+    if (modelName === '跟随网球示例') {
+        const dirX = Math.sin(robotState.rotation);
+        const dirZ = Math.cos(robotState.rotation);
+        
+        const camX = robotState.x + dirX * 0.85;
+        const camZ = robotState.z + dirZ * 0.85;
+        
+        const dx = target.position.x - camX;
+        const dz = target.position.z - camZ;
+        const distance = Math.sqrt(dx * dx + dz * dz);
+        
+        const targetAngle = Math.atan2(dx, dz);
+        let angleDiff = targetAngle - robotState.rotation;
+        
+        while (angleDiff > Math.PI) angleDiff -= Math.PI * 2;
+        while (angleDiff < -Math.PI) angleDiff += Math.PI * 2;
+        
+        const FOV = Math.PI / 4; 
+        let isVisible = Math.abs(angleDiff) <= FOV;
+        
+        if (distance <= 1.5 && isVisible) {
+            return [0, 0];
+        } else if (!isVisible) {
+            return [0, turnSpeed];
+        } else {
+            let targetTurn = angleDiff * 1.0;
+            targetTurn = Math.max(-turnSpeed * 1.5, Math.min(turnSpeed * 1.5, targetTurn));
+            let targetSpeedVal = Math.min(speed, (distance - 1.5) * 0.5);
+            if (Math.abs(angleDiff) > Math.PI / 6) {
+                targetSpeedVal *= 0.5;
+            }
+            return [targetSpeedVal, targetTurn];
+        }
+    }
+    return [0, 0];
+}
+
 export default function App() {
     // State
     const [isRecording, setIsRecording] = useState(false);
@@ -31,6 +69,7 @@ export default function App() {
     const [sceneType, setSceneType] = useState(() => localStorage.getItem('sceneType') || 'basic');
     const [sceneSize, setSceneSize] = useState(() => localStorage.getItem('sceneSize') || 'medium');
     const [sceneComplexity, setSceneComplexity] = useState(() => localStorage.getItem('sceneComplexity') || 'low');
+    const [hasBucket, setHasBucket] = useState(() => localStorage.getItem('hasBucket') !== 'false');
     const [hasArm, setHasArm] = useState(() => localStorage.getItem('hasArm') === 'true');
     const [lightPos, setLightPos] = useState(() => {
         const saved = localStorage.getItem('lightPos');
@@ -41,21 +80,58 @@ export default function App() {
     const [logs, setLogs] = useState<{ message: string, type: string, time: string }[]>([
         { message: 'System initialized. Waiting for commands...', type: 'info', time: new Date().toLocaleTimeString() }
     ]);
+    const [verboseLogs, setVerboseLogs] = useState(() => localStorage.getItem('verboseLogs') === 'true');
     const [actionChunks, setActionChunks] = useState<number[]>([]);
     const [activeKeys, setActiveKeys] = useState<Record<string, boolean>>({});
     const [actTask, setActTask] = useState<ACTTask>('idle');
     const [actExecutorState, setActExecutorState] = useState<{ task: ACTTask; subTask: string; isComplete: boolean; isExecuting: boolean } | null>(null);
+
+    // Auto Collection State
+    const [isAutoCollecting, setIsAutoCollecting] = useState(false);
+    const [autoCollectConfig, setAutoCollectConfig] = useState({
+        targetEpisodes: 20,
+        robotRange: { min: -5, max: 5 },
+        ballRange: { min: -8, max: 8 },
+        minBallDistance: 3,
+        timeout: 30
+    });
+    const [autoCollectStats, setAutoCollectStats] = useState({
+        currentEpisode: 0,
+        successCount: 0,
+        failCount: 0
+    });
 
     // Persist settings
     useEffect(() => {
         localStorage.setItem('sceneType', sceneType);
         localStorage.setItem('sceneSize', sceneSize);
         localStorage.setItem('sceneComplexity', sceneComplexity);
+        localStorage.setItem('hasBucket', hasBucket.toString());
         localStorage.setItem('hasArm', hasArm.toString());
         localStorage.setItem('lightPos', JSON.stringify(lightPos));
         localStorage.setItem('speed', speed.toString());
         localStorage.setItem('turnSpeed', turnSpeed.toString());
-    }, [sceneType, sceneSize, sceneComplexity, hasArm, lightPos, speed, turnSpeed]);
+    }, [sceneType, sceneSize, sceneComplexity, hasBucket, hasArm, lightPos, speed, turnSpeed]);
+
+    useEffect(() => {
+        localStorage.setItem('verboseLogs', verboseLogs.toString());
+    }, [verboseLogs]);
+
+    useEffect(() => {
+        autoCollectConfigRef.current = autoCollectConfig;
+    }, [autoCollectConfig]);
+
+    useEffect(() => {
+        autoCollectStatsRef.current = autoCollectStats;
+    }, [autoCollectStats]);
+
+    useEffect(() => {
+        isAutoCollectingRef.current = isAutoCollecting;
+    }, [isAutoCollecting]);
+
+    useEffect(() => {
+        isInferencingRef.current = isInferencing;
+    }, [isInferencing]);
 
     // Cloud Training State
     const [trainingMode, setTrainingMode] = useState<'frontend' | 'cloud'>('frontend');
@@ -111,7 +187,8 @@ export default function App() {
         lastManualLogTime: 0,
         armController: null as ArmController | null,
         actExecutor: null as ACTExecutor | null,
-        prevIsExecuting: false
+        prevIsExecuting: false,
+        autoCollectStartTime: 0
     });
 
     const isAtBottom = useRef(true);
@@ -119,6 +196,11 @@ export default function App() {
     const draggingObject = useRef<THREE.Mesh | null>(null);
     const raycaster = useRef(new THREE.Raycaster());
     const mouse = useRef(new THREE.Vector2());
+    
+    const autoCollectConfigRef = useRef(autoCollectConfig);
+    const autoCollectStatsRef = useRef(autoCollectStats);
+    const isAutoCollectingRef = useRef(isAutoCollecting);
+    const isInferencingRef = useRef(isInferencing);
 
     const handleLogScroll = () => {
         if (logContainerRef.current) {
@@ -133,7 +215,9 @@ export default function App() {
         }
     }, [logs]);
 
-    const addLog = useCallback((message: string, type = 'info') => {
+    const addLog = useCallback((message: string, type = 'info', isVerbose = false) => {
+        if (isVerbose && !verboseLogs) return;
+        
         setLogs(prev => {
             const newLogs = [...prev, { message, type, time: new Date().toLocaleTimeString() }];
             if (newLogs.length > 200) {
@@ -141,7 +225,7 @@ export default function App() {
             }
             return newLogs;
         });
-    }, []);
+    }, [verboseLogs]);
 
     const clearLogs = () => setLogs([]);
 
@@ -535,9 +619,10 @@ export default function App() {
         group.add(bucket);
         sim.current.walls.push(bucket);
         sim.current.bucket = bucket;
+        bucket.visible = hasBucket;
 
         addLog(`Scene updated: ${sceneType}, Size: ${sceneSize}, Complexity: ${sceneComplexity}`, 'info');
-    }, [sceneType, sceneSize, sceneComplexity, addLog]);
+    }, [sceneType, sceneSize, sceneComplexity, hasBucket, addLog]);
 
     const [enableCollisionProtection, setEnableCollisionProtection] = useState(() => {
         const saved = localStorage.getItem('enableCollisionProtection');
@@ -631,11 +716,19 @@ export default function App() {
         // So we should map our keys to discrete actions.
 
         let action = [0, 0, 0, 0, 1]; // Default stop
-        const keys = sim.current.keys;
-        if (keys['w'] || keys['arrowup']) action = [1, 0, 0, 0, 0];
-        else if (keys['s'] || keys['arrowdown']) action = [0, 1, 0, 0, 0];
-        else if (keys['a'] || keys['arrowleft']) action = [0, 0, 1, 0, 0];
-        else if (keys['d'] || keys['arrowright']) action = [0, 0, 0, 1, 0];
+        
+        // 自动采集时使用专家策略的动作
+        const isAuto = isAutoCollectingRef.current || isInferencingRef.current;
+        if (isAuto) {
+            const expertAction = getExpertAction('跟随网球示例', sim.current.robotState, sim.current.target, speed, turnSpeed);
+            action = expertAction;
+        } else {
+            const keys = sim.current.keys;
+            if (keys['w'] || keys['arrowup']) action = [1, 0, 0, 0, 0];
+            else if (keys['s'] || keys['arrowdown']) action = [0, 1, 0, 0, 0];
+            else if (keys['a'] || keys['arrowleft']) action = [0, 0, 1, 0, 0];
+            else if (keys['d'] || keys['arrowright']) action = [0, 0, 0, 1, 0];
+        }
 
         const frame = {
             state: state,
@@ -644,6 +737,10 @@ export default function App() {
             imageBase64: imageBase64,
             action: action
         };
+        
+        if (sim.current.currentEpisode.length % 10 === 0) {
+            addLog(`[Record] action=[${action[0]?.toFixed(2)}, ${action[1]?.toFixed(2)}]`, 'info', true);
+        }
 
         sim.current.currentEpisode.push(frame);
 
@@ -763,10 +860,6 @@ export default function App() {
             state.z = nextZ;
         } else {
             state.velocity = 0;
-            // Debug log
-            if (Date.now() % 500 < 50) {
-                console.log(`[Physics] Collision detected at (${state.x.toFixed(2)}, ${state.z.toFixed(2)}), nextPos=(${nextX.toFixed(2)}, ${nextZ.toFixed(2)})`);
-            }
         }
 
         state.rotation += state.angularVelocity;
@@ -1035,6 +1128,128 @@ export default function App() {
         addLog('Robot and target reset', 'warning');
     };
 
+    const generateRandomPositions = () => {
+        const { robotRange, ballRange, minBallDistance } = autoCollectConfig;
+        
+        const robotX = robotRange.min + Math.random() * (robotRange.max - robotRange.min);
+        const robotZ = robotRange.min + Math.random() * (robotRange.max - robotRange.min);
+        
+        let ballX: number, ballZ: number;
+        let attempts = 0;
+        do {
+            ballX = ballRange.min + Math.random() * (ballRange.max - ballRange.min);
+            ballZ = ballRange.min + Math.random() * (ballRange.max - ballRange.min);
+            attempts++;
+        } while (
+            Math.hypot(ballX - robotX, ballZ - robotZ) < minBallDistance && 
+            attempts < 100
+        );
+        
+        return { robotX, robotZ, ballX, ballZ };
+    };
+
+    const startAutoCollectEpisode = useCallback(() => {
+        const currentStats = autoCollectStatsRef.current;
+        const currentConfig = autoCollectConfigRef.current;
+        const { robotX, robotZ, ballX, ballZ } = generateRandomPositions();
+        
+        sim.current.robotState.x = robotX;
+        sim.current.robotState.z = robotZ;
+        sim.current.robotState.rotation = Math.PI;
+        sim.current.robotState.velocity = 0;
+        sim.current.robotState.angularVelocity = 0;
+        sim.current.autoCollectStartTime = Date.now();
+        
+        if (sim.current.robot) {
+            sim.current.robot.position.set(robotX, 0, robotZ);
+            sim.current.robot.rotation.y = Math.PI;
+        }
+        
+        if (sim.current.target) {
+            sim.current.target.position.set(ballX, 0.25, ballZ);
+        }
+        
+        setActiveKeys({});
+        setActionChunks([]);
+        
+        if (!sim.current.isRecording) {
+            sim.current.isRecording = true;
+            sim.current.currentEpisode = [];
+            setIsRecording(true);
+            addLog(`Episode ${currentStats.currentEpisode + 1}: Started at (${robotX.toFixed(1)}, ${robotZ.toFixed(1)})`, 'info');
+            
+            if (sim.current.recordingIntervalId) clearInterval(sim.current.recordingIntervalId);
+            sim.current.recordingIntervalId = setInterval(recordFrame, 100);
+        }
+    }, [autoCollectConfig, autoCollectStats.currentEpisode, recordFrame]);
+
+    const checkEpisodeComplete = useCallback(() => {
+        if (!sim.current.target) return { complete: false, success: false };
+        
+        const distance = Math.hypot(
+            sim.current.target.position.x - sim.current.robotState.x,
+            sim.current.target.position.z - sim.current.robotState.z
+        );
+        
+        const elapsedTime = (Date.now() - sim.current.autoCollectStartTime) / 1000;
+        
+        if (distance < 2.5) {
+            return { complete: true, success: true };
+        }
+        
+        if (sim.current.isColliding || elapsedTime > autoCollectConfig.timeout) {
+            return { complete: true, success: false };
+        }
+        
+        return { complete: false, success: false };
+    }, [autoCollectConfig.timeout]);
+
+    const finishAutoCollectEpisode = useCallback((success: boolean) => {
+        const currentStats = autoCollectStatsRef.current;
+        
+        if (sim.current.isRecording) {
+            sim.current.isRecording = false;
+            setIsRecording(false);
+            if (sim.current.recordingIntervalId) {
+                clearInterval(sim.current.recordingIntervalId);
+            }
+            
+            if (sim.current.currentEpisode.length > 0) {
+                sim.current.episodes.push([...sim.current.currentEpisode]);
+                setEpisodesCount(sim.current.episodes.length);
+                addLog(`Episode ${currentStats.currentEpisode + 1} ${success ? 'SUCCESS' : 'FAILED'}. Total: ${sim.current.episodes.length}`, success ? 'success' : 'warning');
+            }
+            
+            setAutoCollectStats(prev => ({
+                currentEpisode: prev.currentEpisode + 1,
+                successCount: success ? prev.successCount + 1 : prev.successCount,
+                failCount: success ? prev.failCount : prev.failCount + 1
+            }));
+        }
+    }, []);
+
+    const stopAutoCollect = useCallback(() => {
+        setIsAutoCollecting(false);
+        sim.current.isInferencing = false;
+        setIsInferencing(false);
+        
+        if (sim.current.inferenceTimeoutId) {
+            clearTimeout(sim.current.inferenceTimeoutId);
+        }
+        
+        if (sim.current.isRecording) {
+            finishAutoCollectEpisode(false);
+        }
+        
+        setAutoCollectStats({
+            currentEpisode: 0,
+            successCount: 0,
+            failCount: 0
+        });
+        
+        addLog('Auto collection stopped', 'warning');
+    }, [finishAutoCollectEpisode]);
+
     // ACT Task Control Functions
     const startACTTask = (task: ACTTask) => {
         if (!sim.current.actExecutor) {
@@ -1272,14 +1487,16 @@ export default function App() {
             }
         }
 
-        const newModel = { name: newModelName };
-        setTrainedModels(prev => [...prev, newModel]);
-        setTrainedModel(newModel);
+        setTrainedModels(prev => {
+            const updated = [...prev, { name: newModelName }];
+            return updated;
+        });
+        setTrainedModel({ name: newModelName });
         setSelectedModel(newModelName);
 
         addLog('Training complete! Model ready for inference.', 'success');
         addLog(`Model: ${newModelName} with CVAE prior, Chunk size: 8`, 'info');
-    }, [addLog, trainedModels.length]);
+    }, [addLog, trainedModels]);
 
     // Cloud Functions
     const fetchCloudModels = useCallback(async () => {
@@ -1565,7 +1782,40 @@ export default function App() {
     const runInference = useCallback(() => {
         if (!sim.current.isInferencing || !sim.current.target) return;
 
+        const isAutoCollectingNow = isAutoCollectingRef.current;
+        
+        if (isAutoCollectingNow) {
+            const currentStats = autoCollectStatsRef.current;
+            const currentConfig = autoCollectConfigRef.current;
+            
+            if (!sim.current.isRecording) {
+                if (currentStats.currentEpisode < currentConfig.targetEpisodes) {
+                    startAutoCollectEpisode();
+                    sim.current.inferenceTimeoutId = setTimeout(runInference, 100);
+                    return;
+                } else {
+                    stopAutoCollect();
+                    addLog(`Auto collection completed! ${currentStats.successCount} success, ${currentStats.failCount} failed`, 'success');
+                    return;
+                }
+            } else {
+                const { complete, success } = checkEpisodeComplete();
+                if (complete) {
+                    finishAutoCollectEpisode(success);
+                    if (currentStats.currentEpisode < currentConfig.targetEpisodes) {
+                        setTimeout(() => startAutoCollectEpisode(), 500);
+                    } else {
+                        setIsAutoCollecting(false);
+                        addLog(`Auto collection completed! ${currentStats.successCount} success, ${currentStats.failCount} failed`, 'success');
+                    }
+                    sim.current.inferenceTimeoutId = setTimeout(runInference, 100);
+                    return;
+                }
+            }
+        }
+
         const { robotState, target, model } = sim.current;
+        addLog(`[runInference] selectedModel="${selectedModel}"`, 'info', true);
 
         if (selectedModel === '跟随网球示例' || selectedModel === '自动避障示例') {
             let targetSpeed = 0;
@@ -1620,16 +1870,15 @@ export default function App() {
                 }
 
                 if (distance <= 1.5 && isVisible) {
-                    // Reached the ball and it's visible: stop completely, no jittering
+                    addLog(`[Expert] distance=${distance.toFixed(2)}, isVisible=${isVisible} → STOP`, 'info', true);
                     targetSpeed = 0;
                     targetTurn = 0;
                 } else if (!isVisible) {
-                    // Ball out of FOV or blocked: rotate in place to search
+                    addLog(`[Expert] distance=${distance.toFixed(2)}, isVisible=${isVisible} → ROTATE`, 'info', true);
                     targetSpeed = 0;
                     targetTurn = turnSpeed;
                 } else {
-                    // Ball in FOV: track and approach
-                    // Use a smaller multiplier for smoother turning
+                    addLog(`[Expert] distance=${distance.toFixed(2)}, isVisible=${isVisible} → MOVE`, 'info', true);
                     targetTurn = angleDiff * 1.0;
                     
                     // Cap the turn speed to prevent violent swings
@@ -1763,8 +2012,11 @@ export default function App() {
         state[2] = robotState.rotation;
         state[3] = robotState.velocity;
         state[4] = targetDist;
+        
+        addLog(`[ACT] state: x=${state[0]?.toFixed(1)}, z=${state[1]?.toFixed(1)}, rot=${state[2]?.toFixed(1)}, vel=${state[3]?.toFixed(2)}, dist=${state[4]?.toFixed(1)}`, 'info', true);
 
         const prediction = actService.predict(model, image, state);
+        addLog(`[ACT] prediction[0]=${prediction[0]?.toFixed(3)}, prediction[1]=${prediction[1]?.toFixed(3)}`, 'info', true);
 
         // Temporal Ensembling (simplified)
         if (!sim.current.actionBuffer) sim.current.actionBuffer = [];
@@ -1843,8 +2095,41 @@ export default function App() {
         }
 
         // Match training frequency (10Hz = 100ms)
+        addLog(`[runInference] Setting timeout to continue loop`, 'info');
         sim.current.inferenceTimeoutId = setTimeout(runInference, 100);
-    }, [addLog, captureImage, speed, turnSpeed, selectedModel]);
+    }, [addLog, captureImage, speed, turnSpeed, selectedModel, isAutoCollecting, autoCollectConfig, autoCollectStats, startAutoCollectEpisode, checkEpisodeComplete, finishAutoCollectEpisode, stopAutoCollect]);
+
+    const startAutoCollect = () => {
+        addLog(`[startAutoCollect] isAutoCollecting=${isAutoCollecting}, isInferencing=${isInferencing}`, 'info');
+        
+        if (isAutoCollecting) {
+            addLog(`[startAutoCollect] Already collecting, stopping`, 'warning');
+            stopAutoCollect();
+            return;
+        }
+        
+        if (isInferencing) {
+            addLog('[startAutoCollect] Please stop current inference first', 'warning');
+            return;
+        }
+        
+        setAutoCollectStats({
+            currentEpisode: 0,
+            successCount: 0,
+            failCount: 0
+        });
+        
+        setIsAutoCollecting(true);
+        sim.current.isInferencing = true;
+        setIsInferencing(true);
+        
+        addLog(`Starting auto collection: ${autoCollectConfig.targetEpisodes} episodes`, 'info');
+        
+        setSelectedModel('跟随网球示例');
+        
+        addLog(`[startAutoCollect] Calling runInference...`, 'info');
+        runInference();
+    };
 
     const startInference = async () => {
         if (isInferencing) {
@@ -2053,6 +2338,24 @@ export default function App() {
                                             <option value="high">高复杂度</option>
                                         </select>
                                     </div>
+                                    <label className="flex items-center gap-2 text-xs text-slate-400 cursor-pointer">
+                                        <input 
+                                            type="checkbox" 
+                                            checked={hasBucket}
+                                            onChange={e => setHasBucket(e.target.checked)}
+                                            className="rounded bg-slate-800 border-slate-700"
+                                        />
+                                        包含桶
+                                    </label>
+                                    <label className="flex items-center gap-2 text-xs text-slate-400 cursor-pointer">
+                                        <input 
+                                            type="checkbox" 
+                                            checked={verboseLogs}
+                                            onChange={e => setVerboseLogs(e.target.checked)}
+                                            className="rounded bg-slate-800 border-slate-700"
+                                        />
+                                        详细日志
+                                    </label>
                                 </div>
                             </div>
 
@@ -2275,6 +2578,48 @@ export default function App() {
                                     清空
                                 </button>
                             </div>
+                            <div className="border-t border-slate-800 pt-3 mt-3">
+                                <div className="flex items-center justify-between mb-2">
+                                    <span className="text-xs font-semibold text-cyan-400 uppercase">自动采集</span>
+                                </div>
+                                <div className="flex gap-2 mb-2">
+                                    <button 
+                                        onClick={startAutoCollect} 
+                                        disabled={isTraining}
+                                        className={`flex-1 ${isAutoCollecting ? 'bg-cyan-600/40' : 'bg-cyan-600/20'} hover:bg-cyan-600/30 text-cyan-400 border border-cyan-500/30 py-2 px-4 rounded-lg font-medium transition-all flex items-center justify-center gap-2 disabled:opacity-50`}
+                                    >
+                                        <span className={`w-2 h-2 rounded-full ${isAutoCollecting ? 'bg-cyan-500 animate-pulse' : ''}`}></span>
+                                        {isAutoCollecting ? '停止自动采集' : '开始自动采集'}
+                                    </button>
+                                </div>
+                                <div className="flex items-center gap-2 text-xs text-slate-400 mb-2">
+                                    <span>目标轮数:</span>
+                                    <input 
+                                        type="number" 
+                                        min="1" 
+                                        max="100"
+                                        value={autoCollectConfig.targetEpisodes}
+                                        onChange={e => setAutoCollectConfig({...autoCollectConfig, targetEpisodes: parseInt(e.target.value) || 20})}
+                                        className="w-16 bg-slate-800 border border-slate-700 text-slate-300 rounded px-2 py-1 text-center"
+                                    />
+                                </div>
+                                {isAutoCollecting && (
+                                    <div className="text-xs mono bg-slate-900/50 p-2 rounded border border-cyan-500/20">
+                                        <div className="flex justify-between text-slate-400 mb-1">
+                                            <span>进度:</span>
+                                            <span className="text-cyan-400">{autoCollectStats.currentEpisode} / {autoCollectConfig.targetEpisodes}</span>
+                                        </div>
+                                        <div className="flex justify-between text-slate-400 mb-1">
+                                            <span>成功:</span>
+                                            <span className="text-green-400">{autoCollectStats.successCount}</span>
+                                        </div>
+                                        <div className="flex justify-between text-slate-400">
+                                            <span>失败:</span>
+                                            <span className="text-red-400">{autoCollectStats.failCount}</span>
+                                        </div>
+                                    </div>
+                                )}
+                            </div>
                         </div>
                         {trainingMode === 'cloud' && (
                             <div className="space-y-3 p-3 bg-purple-900/10 border border-purple-500/20 rounded-lg">
@@ -2366,8 +2711,9 @@ export default function App() {
                                         onChange={e => setSelectedModel(e.target.value)}
                                     >
                                         <option value="">选择推理模式...</option>
-                                        <option value="跟随网球示例">🎾 跟随网球示例（ready）</option>
-                                        <option value="自动避障示例">🛡️ 避障示例（ready）</option>
+                                        {trainedModels.map((model, idx) => (
+                                            <option key={idx} value={model.name}>{model.name}</option>
+                                        ))}
                                         {!hasArm ? (
                                             <>
                                                 <option value="findAndPickBall" disabled>🎯 找到小球并拾取（需机械臂）</option>
