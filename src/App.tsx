@@ -11,7 +11,7 @@ import { tr } from 'motion/react-client';
 import { ACTExecutor, ACTTask } from './sim/actExecutor';
 import { ArmController } from './sim/armController';
 
-function getExpertAction(modelName: string, robotState: { x: number, z: number, rotation: number, velocity: number }, target: { position: { x: number, z: number } }, speed: number, turnSpeed: number): number[] {
+function getExpertAction(modelName: string, robotState: { x: number, z: number, rotation: number, velocity: number }, target: { position: { x: number, z: number } }, speed: number, turnSpeed: number, simRef?: any): number[] {
     if (modelName === '跟随网球示例') {
         const dirX = Math.sin(robotState.rotation);
         const dirZ = Math.cos(robotState.rotation);
@@ -33,10 +33,15 @@ function getExpertAction(modelName: string, robotState: { x: number, z: number, 
         let isVisible = Math.abs(angleDiff) <= FOV;
         
         if (distance <= 1.5 && isVisible) {
+            simRef.current.searchTurnDirection = 0;
             return [0, 0];
         } else if (!isVisible) {
-            return [0, turnSpeed];
+            if (!simRef.current.searchTurnDirection) {
+                simRef.current.searchTurnDirection = Math.random() < 0.5 ? turnSpeed : -turnSpeed;
+            }
+            return [0, simRef.current.searchTurnDirection];
         } else {
+            simRef.current.searchTurnDirection = 0;
             let targetTurn = angleDiff * 1.0;
             targetTurn = Math.max(-turnSpeed * 1.5, Math.min(turnSpeed * 1.5, targetTurn));
             let targetSpeedVal = Math.min(speed, (distance - 1.5) * 0.5);
@@ -720,7 +725,7 @@ export default function App() {
         // 自动采集时使用专家策略的动作
         const isAuto = isAutoCollectingRef.current || isInferencingRef.current;
         if (isAuto) {
-            const expertAction = getExpertAction('跟随网球示例', sim.current.robotState, sim.current.target, speed, turnSpeed);
+            const expertAction = getExpertAction('跟随网球示例', sim.current.robotState, sim.current.target, speed, turnSpeed, sim);
             action = expertAction;
         } else {
             const keys = sim.current.keys;
@@ -1871,13 +1876,18 @@ export default function App() {
 
                 if (distance <= 1.5 && isVisible) {
                     addLog(`[Expert] distance=${distance.toFixed(2)}, isVisible=${isVisible} → STOP`, 'info', true);
+                    sim.current.searchTurnDirection = 0;
                     targetSpeed = 0;
                     targetTurn = 0;
                 } else if (!isVisible) {
+                    if (!sim.current.searchTurnDirection) {
+                        sim.current.searchTurnDirection = Math.random() < 0.5 ? turnSpeed : -turnSpeed;
+                    }
                     addLog(`[Expert] distance=${distance.toFixed(2)}, isVisible=${isVisible} → ROTATE`, 'info', true);
                     targetSpeed = 0;
-                    targetTurn = turnSpeed;
+                    targetTurn = sim.current.searchTurnDirection;
                 } else {
+                    sim.current.searchTurnDirection = 0;
                     addLog(`[Expert] distance=${distance.toFixed(2)}, isVisible=${isVisible} → MOVE`, 'info', true);
                     targetTurn = angleDiff * 1.0;
                     
